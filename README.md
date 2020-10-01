@@ -8,6 +8,10 @@ This project complies with the NYC MTA Terms of Service for accessing their feed
 providing information based on it.
 https://api.mta.info/#/DataFeedAgreement
 
+This project _also_ provides an option to directly scrape the new.mta.info website for
+the same data instead of using the GTFS feed.  This is sometimes preferable as the two
+sources can be out of sync.
+
 
 ## Configuration
 Set the following as environment variables:

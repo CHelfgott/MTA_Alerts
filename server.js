@@ -19,8 +19,7 @@ app.get('/lines', function(req, res) {
 
 /**
  * Get status for a given line.
- * Params:
- *   - line      - String - the name of the subway line
+ * @param  {String} line  - the name of the subway line
  */
 app.get('/status/:line', function(req, res) {
   const { line } = req.params;
@@ -29,8 +28,7 @@ app.get('/status/:line', function(req, res) {
 
 /**
  * Get uptime fraction for a given line.
- * Params:
- *   - line      - String - the name of the subway line
+ * @param  {String} line  - the name of the subway line
  */
 app.get('/uptime/:line', function(req, res) {
   const { line } = req.params;

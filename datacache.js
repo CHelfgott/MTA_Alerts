@@ -1,5 +1,6 @@
 const https = require('https');
 const ProtoBuf = require('protobufjs');
+const puppeteer = require('puppeteer');
 
 const nsBuilder = ProtoBuf.loadProtoFile("lib/protos/nyct-subway.proto");
 const nstrDecoder = nsBuilder.build("transit_realtime").FeedMessage;
@@ -22,7 +23,8 @@ const REFRESH_INTERVAL = 59 * 1000;
 
 // List of NYC MTA subway GTFS feeds.
 const FEED_IDS = [
-  'camsys%2Fsubway-alerts'           // As it turns out, we only need the alerts feed.
+  'nyct%2fgtfs-ace'
+//  'camsys%2Fsubway-alerts'           // As it turns out, we only need the alerts feed.
 /*
   'camsys%2Fsubway-alerts',
   'nyct%2fgtfs',
@@ -37,6 +39,8 @@ const FEED_IDS = [
 */
 ];
 
+// Ideally, we'd pull this from the feeds themselves, but the alerts feed only
+// gives alerts for lines with a non-trivial status.
 const SUBWAY_LINES = [
   '1','2','3','4','5','6','7',
   'A','B','C','D','E','F','G','J','L','M','N','Q','R','W','Z',
@@ -51,7 +55,7 @@ const SUBWAY_LINES = [
  * @param  {String} apiKey     - key for MTA GTFS API
  * @return {Promise<Object>}   - Promise of parsed feed.
  */
-function makeRequest(baseUrl, feedId, apiKey) {
+function makeGtfsRequest(baseUrl, feedId, apiKey) {
   const feedUrl = baseUrl + feedId;
   
   return new Promise((resolve, reject) => {
@@ -91,6 +95,68 @@ function makeRequest(baseUrl, feedId, apiKey) {
 
 }
 
+/**
+ * Scrape the MTA webpage for subway status.
+ * @return {Promise<Object>}   - Promise of parsed webpage.
+ */
+async function scrapePage() {
+  const url = 'https://new.mta.info';
+  
+  const browser = await puppeteer.launch();
+  const page = await browser.newPage();
+  
+  await page.goto(url);
+  
+  // As it turns out, the accessibility section of the page is more parsable
+  // then the horrible asynchronously-rendered blob that the rest of it is.
+  // And the puppeteer snapshot even more so.
+  const snapshot = await page.accessibility.snapshot();
+
+  /**
+   * The accessible version of the website is arranged as follows:
+   * <a bunch of stuff>
+   * { role: 'heading', name: 'Service Status', level: 3 },
+   * <more stuff>
+   * { role: 'heading', name: <some service status>, level: 5 },
+   * { role: 'button', name: 'Click to open a modal with more information about Subway Line <line>' }
+   * < more subway line buttons >
+   * < more service status blocks, each with their own headers and line buttons >
+   * <other stuff, some of which has level: 2>
+   */
+  
+  var serviceStatusSection = false;
+  var heading = '';
+  const lineStatus = {};
+  snapshot.children.forEach((node) => {
+    if (node.role == 'heading' && node.name == 'Service Status') {
+      serviceStatusSection = true;
+    } else if (serviceStatusSection) {
+      if (node.role == 'heading') {
+        if (node.level == 5) {
+          heading = node.name;
+        } else {
+          heading = '';
+        }
+      }
+      if (heading && node.role == 'button') {
+        const lineMatch = node.name.match(/Subway Line ([\w*])$/)
+        if (lineMatch) {
+          const line = lineMatch[1];
+          if (heading == 'Delays') {
+            lineStatus[line] = 'delayed';
+          } else {
+            lineStatus[line] = 'undelayed';
+          }
+        }
+      }
+    }
+  });
+  await browser.close();
+  return lineStatus;
+}
+
+
+// Initial state for subway line data.
 function initLineData(time) {
   return { 
     activeTime: 0, 
@@ -100,64 +166,115 @@ function initLineData(time) {
   };
 }
 
+const sourceIsGtfsApi = false;
+
+/**
+ * Makes an HTTPS request and updates data by line.
+ * Whether the call is to the GTFS API or it is just scraping the
+ * public webpage is determined by the hard-coded sourceIsGtfsApi flag. 
+ * @param  {String} baseUrl    - base URL for MTA GTFS API
+ * @param  {String} apiKey     - key for MTA GTFS API
+ * @param  {Object} lineData   - dictionary of line data by line id
+ */
 function refreshData(baseUrl, apiKey, lineData) {
-  const linesSeen = {};
+  if (sourceIsGtfsApi) {
+  
+    // Maintain a dict of subway lines that show up in the feeds.
+    const linesSeen = {};
 
-  // Match 'Delays' at the beginning of a string, ignoring case.
-  const delaysRegExp = new RegExp('^delays\b', 'i');
+    // Match 'Delays' at the beginning of a string, ignoring case.
+    const delaysRegExp = new RegExp('^delays\b', 'i');
 
-  Promise.all(FEED_IDS.map((feedId) =>
-    makeRequest(baseUrl, feedId, apiKey))
-  ).then((results) => {
-    const currentTime = new Date().getTime();
-    results.forEach((feedMessage) => {
-      feedMessage.entity.forEach((feedEntity) => {
-//        console.log(feedEntity.alert);
-        if (feedEntity.alert && feedEntity.alert.header_text &&
-            feedEntity.alert.header_text.translation) {
-          const alertHeader = feedEntity.alert.header_text.translation.text;
-//          console.log(feedEntity.alert.header_text.translation);
-//          console.log(feedEntity.alert.description_text.translation);  
+    Promise.all(FEED_IDS.map((feedId) =>
+      makeGtfsRequest(baseUrl, feedId, apiKey))
+    ).then((results) => {
+      // Once all the feeds return, check the time; this will be lastUpdated.
+      const currentTime = new Date().getTime();
+    
+      results.forEach((feedMessage) => {
+        feedMessage.entity.forEach((feedEntity) => {
+          // The alert header text generally starts with an enum-type string.
+          if (feedEntity.alert && feedEntity.alert.header_text &&
+              feedEntity.alert.header_text.translation) {
+            const alertHeader = feedEntity.alert.header_text.translation.text;
 
-          if (alertHeader != '' && alertHeader.search(delaysRegExp) >= 0) {          
-            // Now check which lines are affected.
-            feedEntity.alert.informed_entity.forEach((infEntity) => {
-              if (infEntity.route_id) {
-                linesSeen[infEntity.route_id] = true;
-                if (!lineData[infEntity.route_id]) {
-                  lineData[infEntity.route_id] = initLineData(currentTime);
+            // We only care if the string starts with "Delays".
+            if (alertHeader != '' && alertHeader.search(delaysRegExp) >= 0) {          
+              // Now check which lines are affected.
+              feedEntity.alert.informed_entity.forEach((infEntity) => {
+                if (infEntity.route_id) {
+                  linesSeen[infEntity.route_id] = true;
+                  if (!lineData[infEntity.route_id]) {
+                    lineData[infEntity.route_id] = initLineData(currentTime);
+                  }
+                  lineData[infEntity.route_id].activeTime +=
+                    currentTime - lineData[infEntity.route_id].lastUpdated;
+                  lineData[infEntity.route_id].lastUpdated = currentTime;
+                  if (lineData[infEntity.route_id].status == 'NOT DELAYED') {
+                    console.log('Line ', infEntity.route_id, ' is experiencing delays');
+                  }
+                  lineData[infEntity.route_id].status = 'DELAYED';
                 }
-                lineData[infEntity.route_id].activeTime +=
-                  currentTime - lineData[infEntity.route_id].lastUpdated;
-                lineData[infEntity.route_id].lastUpdated = currentTime;
-                if (lineData[infEntity.route_id].status == 'NOT DELAYED') {
-                  console.log('Line ', infEntity.route_id, ' is experiencing delays');
-                }
-                lineData[infEntity.route_id].status = 'DELAYED';
-              }
-            });
+              });
+            }
           }
-        }
+        });
       });
-    });
 
-    // Now that we've parsed all the feeds, update the subway lines that did
-    // _not_ have alerts.
-    SUBWAY_LINES.forEach((lineId) => {
-      if (!linesSeen[lineId]) {
-        const deltaTime = currentTime - lineData[lineId].lastUpdated;
-        lineData[lineId].activeTime += deltaTime;
-        lineData[lineId].lastUpdated = currentTime;
-        if (lineData[lineId].status == 'NOT DELAYED') {
-          lineData[lineId].undelayedTime += deltaTime;
-        } else {
-          console.log('Line ', lineId, ' is now recovered');
+      // Now that we've parsed all the feeds, update the subway lines that did
+      // _not_ have alerts.
+      SUBWAY_LINES.forEach((lineId) => {
+        if (!linesSeen[lineId]) {
+          const deltaTime = currentTime - lineData[lineId].lastUpdated;
+          lineData[lineId].activeTime += deltaTime;
+          lineData[lineId].lastUpdated = currentTime;
+        
+          // TODO(chelfgott): This logic may _not_ be accurate. Alerts are provided
+          // with an "active_period" field which defines when they start and when
+          // they end. So the absence of an alert does not necessarily imply the
+          // absence of a delay, although we expect the MTA feed to refresh delay
+          // alerts periodically.
+          if (lineData[lineId].status == 'NOT DELAYED') {
+            lineData[lineId].undelayedTime += deltaTime;
+          } else {
+            console.log('Line ', lineId, ' is now recovered');
+          }
+          // If we haven't seen a "Delays" alert for this line, then it is not delayed.
+          lineData[lineId].status = 'NOT DELAYED';
         }
-        // If we haven't seen a "Delays" alert for this line, then it is not delayed.
-        lineData[lineId].status = 'NOT DELAYED';
-      }
-    });    
-  }).catch(() => {/* do nothing */});
+      });    
+    }).catch(() => {/* do nothing */});
+    
+  } else {
+
+    // In this case we'll just scrape the MTA webpage.
+    scrapePage().then((lineStatus) => {
+      const currentTime = new Date().getTime();
+      // Update the delayed lines.
+      Object.keys(lineStatus).forEach((line) => {
+        if (!lineData[line]) {
+          lineData[line] = initLineData(currentTime);
+        }
+        const deltaTime = currentTime - lineData[line].lastUpdated;
+        lineData[line].activeTime += deltaTime;          
+        lineData[line].lastUpdated = currentTime;
+        if (lineData[line].status == 'NOT DELAYED' &&
+            lineStatus[line] == 'delayed') {
+          console.log('Line ', line, ' is experiencing delays');
+          lineData[line].status = 'DELAYED';
+        }
+        if (lineStatus[line] == 'undelayed') {
+          lineData[line].undelayedTime += deltaTime;
+          if (lineData[line].status == 'DELAYED') {
+            console.log('Line ', line, ' is experiencing delays');
+            lineData[line].status = 'NOT DELAYED';
+          }
+        }        
+      });
+
+    }).catch(() => {/* do nothing */});
+    
+  }
 }
 
 class DataCache {
